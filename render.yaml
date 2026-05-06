@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: roadguard-ai-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRE_DAYS
+        value: "30"
+      - key: PORT
+        value: "10000"
+    disk:
+      name: roadguard-data
+      mountPath: /opt/render/project/src
+      sizeGB: 1

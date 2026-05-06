@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+roadguard.db
+.DS_Store
