@@ -7,6 +7,7 @@ import os
 import uuid
 import logging
 import random
+import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List
@@ -16,10 +17,12 @@ from jose import JWTError, jwt
 from fastapi import (
     FastAPI, HTTPException, Depends, status,
     UploadFile, File, Form, WebSocket, WebSocketDisconnect,
+    Request,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import (
     create_engine, Column, Integer, String, Float,
@@ -73,7 +76,7 @@ class User(Base):
 class HazardEvent(Base):
     __tablename__ = "hazard_events"
     id           = Column(Integer, primary_key=True, autoincrement=True)
-    timestamp    = Column(DateTime, default=datetime.utcnow)
+    timestamp    = Column(DateTime, default=datetime.utcnow, index=True)
     latitude     = Column(Float, nullable=False)
     longitude    = Column(Float, nullable=False)
     label        = Column(Integer, nullable=False)   # 0=Normal 1=SpeedBreaker 2=Pothole
@@ -88,21 +91,73 @@ class HazardEvent(Base):
     user_id      = Column(Integer, ForeignKey("users.id"), nullable=True)
     description  = Column(Text, nullable=True)
     distance     = Column(Float, nullable=True)
+    report_count = Column(Integer, default=1)
+    device_count = Column(Integer, default=1)
+    cluster_id   = Column(Integer, ForeignKey("event_clusters.id"), nullable=True)
+    image_path   = Column(String, nullable=True)
+    last_seen    = Column(DateTime, default=datetime.utcnow)
+    created_at   = Column(DateTime, default=datetime.utcnow)
 
 
 class HazardReport(Base):
     __tablename__ = "hazard_reports"
-    id          = Column(Integer, primary_key=True, autoincrement=True)
-    user_id     = Column(Integer, ForeignKey("users.id"), nullable=False)
-    latitude    = Column(Float, nullable=False)
-    longitude   = Column(Float, nullable=False)
-    description = Column(String, nullable=True)
-    image_path  = Column(String, nullable=True)
-    status      = Column(String, default="pending")
-    hazard_type = Column(Integer, nullable=True)
-    confidence  = Column(Float, nullable=True)
-    created_at  = Column(DateTime, default=datetime.utcnow)
-    reviewed_at = Column(DateTime, nullable=True)
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    user_id         = Column(Integer, ForeignKey("users.id"), nullable=True)
+    device_id       = Column(String, nullable=False, index=True)
+    latitude        = Column(Float, nullable=False)
+    longitude       = Column(Float, nullable=False)
+    description     = Column(String, nullable=True)
+    image_path      = Column(String, nullable=True)
+    status          = Column(String, default="pending")
+    hazard_type     = Column(Integer, nullable=True)
+    confidence      = Column(Float, nullable=True)
+    hazard_event_id = Column(Integer, ForeignKey("hazard_events.id"), nullable=True)
+    source          = Column(String, default="user_report")
+    created_at      = Column(DateTime, default=datetime.utcnow)
+    reviewed_at     = Column(DateTime, nullable=True)
+
+
+class SensorCandidate(Base):
+    __tablename__ = "sensor_candidates"
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    device_id       = Column(String, nullable=False, index=True)
+    latitude        = Column(Float, nullable=False)
+    longitude       = Column(Float, nullable=False)
+    speed           = Column(Float, nullable=True)
+    confidence      = Column(Float, nullable=False)
+    hazard_type     = Column(Integer, nullable=True)
+    status          = Column(String, default="pending")
+    timestamp       = Column(DateTime, nullable=False, index=True)
+    hazard_event_id = Column(Integer, ForeignKey("hazard_events.id"), nullable=True)
+    created_at      = Column(DateTime, default=datetime.utcnow)
+
+
+class DeviceSession(Base):
+    __tablename__ = "device_sessions"
+    id                 = Column(Integer, primary_key=True, autoincrement=True)
+    device_id          = Column(String, nullable=False, unique=True, index=True)
+    first_seen         = Column(DateTime, default=datetime.utcnow)
+    last_seen          = Column(DateTime, default=datetime.utcnow)
+    last_submission_at = Column(DateTime, nullable=True)
+    submissions_total  = Column(Integer, default=0)
+    is_throttled       = Column(Boolean, default=False)
+    banned_until       = Column(DateTime, nullable=True)
+
+
+class EventCluster(Base):
+    __tablename__ = "event_clusters"
+    id                 = Column(Integer, primary_key=True, autoincrement=True)
+    cluster_latitude   = Column(Float, nullable=False)
+    cluster_longitude  = Column(Float, nullable=False)
+    hazard_type        = Column(Integer, nullable=False)
+    confidence_score   = Column(Float, nullable=True)
+    event_count        = Column(Integer, default=0)
+    device_count       = Column(Integer, default=0)
+    status             = Column(String, default="ACTIVE")
+    first_report_ts    = Column(DateTime, default=datetime.utcnow)
+    last_report_ts     = Column(DateTime, default=datetime.utcnow)
+    created_at         = Column(DateTime, default=datetime.utcnow)
+    updated_at         = Column(DateTime, default=datetime.utcnow)
 
 
 def get_db():
@@ -209,6 +264,22 @@ def get_current_user(
     return user
 
 
+def get_optional_user(
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    db: Session = Depends(get_db),
+) -> Optional[User]:
+    if not creds:
+        return None
+    try:
+        payload = _decode(creds.credentials)
+    except JWTError:
+        return None
+    user = db.query(User).filter_by(id=int(payload["sub"]) ).first()
+    if not user or not user.is_active or user.is_banned:
+        return None
+    return user
+
+
 def get_admin(user: User = Depends(get_current_user)) -> User:
     if user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
@@ -242,6 +313,306 @@ class EventUpdateReq(BaseModel):
     status: Optional[str] = None
 
 
+class ReportRequest(BaseModel):
+    type: str
+    latitude: float
+    longitude: float
+    timestamp: datetime
+    image: Optional[str] = None   # base64 string
+
+
+class SensorEventReq(BaseModel):
+    device_id: str
+    latitude: float
+    longitude: float
+    timestamp: datetime
+    confidence: float
+    speed: Optional[float] = None
+    hazard_type: Optional[int] = None
+    source: Optional[str] = "sensor"
+
+
+class HazardReportReq(BaseModel):
+    device_id: str
+    latitude: float
+    longitude: float
+    timestamp: datetime
+    confidence: float
+    hazard_type: int
+    description: Optional[str] = None
+
+
+class HazardStatusReq(BaseModel):
+    status: str
+
+
+hazard_subscribers = []
+
+
+def _haversine_meters(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    import math
+    r = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return r * c
+
+
+def _validate_coordinates(latitude: float, longitude: float):
+    if latitude is None or longitude is None:
+        raise HTTPException(400, "latitude and longitude are required")
+    if not (-90.0 <= latitude <= 90.0 and -180.0 <= longitude <= 180.0):
+        raise HTTPException(400, "Invalid latitude or longitude")
+
+
+def _validate_timestamp(timestamp: datetime):
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.replace(tzinfo=None)  # Make naive
+    now = datetime.utcnow()
+    if timestamp > now + timedelta(minutes=2):
+        raise HTTPException(400, "timestamp cannot be in the future")
+    if timestamp < now - timedelta(hours=1):
+        raise HTTPException(400, "timestamp is too old")
+
+
+def _validate_confidence(confidence: float):
+    if confidence is None or not (0.0 <= confidence <= 1.0):
+        raise HTTPException(400, "confidence must be between 0.0 and 1.0")
+    if confidence < 0.30:
+        raise HTTPException(400, "confidence is too low for confirmed hazard reporting")
+
+
+def _validate_speed(speed: Optional[float]):
+    if speed is None:
+        return
+    if speed < 0 or speed > 180:
+        raise HTTPException(400, "speed is out of realistic range")
+
+
+def _validate_device_id(device_id: str):
+    if not device_id or len(device_id) > 64:
+        raise HTTPException(400, "device_id is required and must be under 64 chars")
+    normalized = device_id.replace("-", "").replace("_", "")
+    if not normalized.isalnum():
+        raise HTTPException(400, "device_id contains invalid characters")
+
+
+def _check_rate_limit(device_id: str, db: Session):
+    now = datetime.utcnow()
+    session = db.query(DeviceSession).filter_by(device_id=device_id).first()
+    window_start = now - timedelta(minutes=10)
+    recent_sensor = db.query(SensorCandidate).filter(
+        SensorCandidate.device_id == device_id,
+        SensorCandidate.created_at >= window_start,
+    ).count()
+    recent_reports = db.query(HazardReport).filter(
+        HazardReport.device_id == device_id,
+        HazardReport.created_at >= window_start,
+    ).count()
+    total_recent = recent_sensor + recent_reports
+    if total_recent >= 12:
+        msg = "Rate limit exceeded: too many confirmed hazard submissions from this device"
+        raise HTTPException(status_code=429, detail=msg)
+    if session and session.banned_until and session.banned_until > now:
+        raise HTTPException(status_code=429, detail="Device blocked from submitting hazards")
+    if not session:
+        session = DeviceSession(device_id=device_id, first_seen=now, last_seen=now)
+        db.add(session)
+    session.last_seen = now
+    session.last_submission_at = now
+    session.submissions_total = (session.submissions_total or 0) + 1
+    db.add(session)
+    db.commit()
+
+
+def _normalize_timestamp(timestamp: datetime) -> datetime:
+    if timestamp.tzinfo is not None:
+        return timestamp.replace(tzinfo=None)
+    return timestamp
+
+
+def _find_existing_hazard(
+    db: Session,
+    latitude: float,
+    longitude: float,
+    timestamp: datetime,
+    hazard_type: Optional[int],
+    confidence: float,
+) -> Optional[HazardEvent]:
+    timestamp = _normalize_timestamp(timestamp)
+    max_distance = 20.0 if confidence >= 0.85 else 50.0
+    max_age = 30 if confidence >= 0.85 else 120
+    candidates = db.query(HazardEvent).filter(
+        HazardEvent.is_duplicate == False,
+        HazardEvent.status != "IGNORED",
+    ).all()
+    best = None
+    best_dist = float("inf")
+    for event in candidates:
+        if hazard_type is not None and event.hazard_type is not None and event.hazard_type != hazard_type:
+            continue
+        event_ts = _normalize_timestamp(event.timestamp)
+        age = abs((event_ts - timestamp).total_seconds())
+        if age > max_age:
+            continue
+        dist = _haversine_meters(latitude, longitude, event.latitude, event.longitude)
+        if dist > max_distance:
+            continue
+        if dist < best_dist:
+            best_dist = dist
+            best = event
+    return best
+
+
+def _update_hazard_confidence(
+    event: HazardEvent,
+    device_id: str,
+    confidence: float,
+    timestamp: datetime,
+    db: Session,
+    image_path: Optional[str] = None,
+):
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.replace(tzinfo=None)  # Make naive
+    event.report_count = (event.report_count or 1) + 1
+    existing_device = db.query(HazardReport).filter_by(hazard_event_id=event.id, device_id=device_id).count()
+    existing_device += db.query(SensorCandidate).filter_by(hazard_event_id=event.id, device_id=device_id).count()
+    if existing_device == 0:
+        event.device_count = (event.device_count or 1) + 1
+    if event.confidence is None:
+        event.confidence = confidence
+    else:
+        event.confidence = round((event.confidence * (event.report_count - 1) + confidence) / event.report_count, 4)
+    event.last_seen = max(event.last_seen or event.timestamp, timestamp)
+    if timestamp > event.timestamp:
+        event.timestamp = timestamp
+    if image_path and not event.image_path:
+        event.image_path = image_path
+    event.p_final = event.confidence
+    event.is_duplicate = False
+    db.add(event)
+    db.commit()
+    return event
+
+
+def _lookup_cluster(db: Session, event: HazardEvent) -> Optional[EventCluster]:
+    clusters = db.query(EventCluster).filter(
+        EventCluster.hazard_type == event.hazard_type,
+        EventCluster.status != "IGNORED",
+    ).all()
+    closest = None
+    closest_distance = float("inf")
+    for cluster in clusters:
+        dist = _haversine_meters(
+            event.latitude, event.longitude,
+            cluster.cluster_latitude, cluster.cluster_longitude,
+        )
+        event_seen = _normalize_timestamp(event.last_seen)
+        cluster_seen = _normalize_timestamp(cluster.last_report_ts)
+        age = abs((event_seen - cluster_seen).total_seconds())
+        if dist <= 50 and age <= 120 and dist < closest_distance:
+            closest = cluster
+            closest_distance = dist
+    return closest
+
+
+def _sync_event_cluster(event: HazardEvent, db: Session):
+    cluster = _lookup_cluster(db, event)
+    if cluster:
+        cluster.event_count += 1
+        cluster.device_count = max(cluster.device_count, event.device_count)
+        cluster.confidence_score = round((cluster.confidence_score * (cluster.event_count - 1) + (event.confidence or 0.0)) / cluster.event_count, 4)
+        cluster.last_report_ts = max(cluster.last_report_ts, event.last_seen)
+        cluster.updated_at = datetime.utcnow()
+    else:
+        cluster = EventCluster(
+            cluster_latitude=event.latitude,
+            cluster_longitude=event.longitude,
+            hazard_type=event.hazard_type or 0,
+            confidence_score=event.confidence or 0.0,
+            event_count=1,
+            device_count=event.device_count or 1,
+            first_report_ts=event.timestamp,
+            last_report_ts=event.last_seen,
+            updated_at=datetime.utcnow(),
+        )
+        db.add(cluster)
+    db.commit()
+    event.cluster_id = cluster.id
+    db.add(event)
+    db.commit()
+    return cluster
+
+
+async def _broadcast_hazard_update(payload: dict):
+    stale = []
+    for ws in list(hazard_subscribers):
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            stale.append(ws)
+    for ws in stale:
+        if ws in hazard_subscribers:
+            hazard_subscribers.remove(ws)
+
+
+async def _create_or_merge_hazard_event(
+    db: Session,
+    latitude: float,
+    longitude: float,
+    timestamp: datetime,
+    confidence: float,
+    hazard_type: Optional[int],
+    device_id: str,
+    description: Optional[str] = None,
+    user_id: Optional[int] = None,
+    image_path: Optional[str] = None,
+    source: Optional[str] = "sensor",
+) -> HazardEvent:
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.replace(tzinfo=None)  # Make naive
+    existing = _find_existing_hazard(db, latitude, longitude, timestamp, hazard_type, confidence)
+    if existing:
+        event = _update_hazard_confidence(existing, device_id, confidence, timestamp, db, image_path=image_path)
+        if description and not event.description:
+            event.description = description
+        _sync_event_cluster(event, db)
+        await _broadcast_hazard_update({"type": "hazard_update", "action": "merged", "hazard": _fmt_event(event)})
+        return event
+
+    label = hazard_type if hazard_type is not None else 2
+    label_names = {0: "NORMAL", 1: "SPEED_BREAKER", 2: "POTHOLE"}
+    status = "ACTIVE" if source == "sensor" else "PENDING"
+    event = HazardEvent(
+        latitude=latitude,
+        longitude=longitude,
+        label=label,
+        label_name=label_names.get(label, "POTHOLE"),
+        hazard_type=label,
+        confidence=confidence,
+        p_sensor=confidence,
+        p_final=confidence,
+        status=status,
+        user_id=user_id,
+        description=description,
+        image_path=image_path,
+        report_count=1,
+        device_count=1,
+        timestamp=timestamp,
+        last_seen=timestamp,
+        created_at=datetime.utcnow(),
+    )
+    db.add(event)
+    db.commit()
+    db.refresh(event)
+    _sync_event_cluster(event, db)
+    await _broadcast_hazard_update({"type": "hazard_update", "action": "created", "hazard": _fmt_event(event)})
+    return event
+
+
 # ─────────────────────────────────────────────────────────────
 #  App
 # ─────────────────────────────────────────────────────────────
@@ -251,6 +622,9 @@ app = FastAPI(
     description="Complete backend — auth, hazards, events, sensor inference",
 )
 
+Path("uploads").mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -259,17 +633,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+reports: List[dict] = []
+hazards: List[dict] = []
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    log.info(f"Incoming request: {request.method} {request.url.path}")
+    response = await call_next(request)
+    return response
+
 
 @app.on_event("startup")
 def startup():
-    seed_db()
+    # seed_db()
     log.info("RoadGuard-AI backend started")
 
 
 # ─────────────────────────────────────────────────────────────
 #  Helpers
 # ─────────────────────────────────────────────────────────────
-def _fmt_event(e: HazardEvent) -> dict:
+def _build_image_url(request: Request, image_path: str) -> str:
+    base = str(request.base_url).rstrip("/")
+    return f"{base}/uploads/{image_path}"
+
+
+def _fmt_event(e: HazardEvent, request: Optional[Request] = None) -> dict:
+    image_url = None
+    if e.image_path and request is not None:
+        image_url = _build_image_url(request, e.image_path)
+
     return {
         "id": e.id,
         "timestamp": e.timestamp.isoformat() if e.timestamp else None,
@@ -286,7 +679,19 @@ def _fmt_event(e: HazardEvent) -> dict:
         "status": e.status or "ACTIVE",
         "description": e.description,
         "distance": e.distance,
+        "image_url": image_url,
     }
+
+
+def _save_hazard_image(image: UploadFile) -> str:
+    uploads_dir = Path("uploads/hazard-images")
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    ext = Path(image.filename).suffix or ".jpg"
+    filename = f"{uuid.uuid4()}{ext}"
+    destination = uploads_dir / filename
+    with open(destination, "wb") as f:
+        f.write(image.file.read())
+    return f"hazard-images/{filename}"
 
 
 def _fmt_user(u: User) -> dict:
@@ -333,6 +738,171 @@ def health():
         "vision_model": "simulation",
         "device": "cpu",
     }
+
+
+@app.post("/report")
+def create_report(req: ReportRequest):
+    log.info("POST /report received")
+    log.info(f"Report payload: {req.dict()}")
+
+    report = {
+        "id": len(reports) + 1,
+        "type": req.type,
+        "latitude": req.latitude,
+        "longitude": req.longitude,
+        "timestamp": req.timestamp.isoformat(),
+        "image": req.image,
+        "status": "pending"   # NEW
+    }
+    reports.append(report)
+
+    return {
+        "success": True,
+        "message": "Report received",
+        "report": report,
+    }
+
+
+@app.get("/reports")
+def get_reports():
+    log.info("GET /reports requested")
+    return reports
+
+
+@app.put("/report/{id}")
+def update_report(id: int, payload: dict):
+    status = payload.get("status")
+    if not status:
+        return {"success": False, "error": "status required"}
+    for r in reports:
+        if r["id"] == id:
+            r["status"] = status
+            return {"success": True}
+    return {"success": False}
+
+
+@app.post("/sensor-events")
+async def ingest_sensor_event(req: SensorEventReq, db: Session = Depends(get_db)):
+    _validate_device_id(req.device_id)
+    _validate_coordinates(req.latitude, req.longitude)
+    _validate_timestamp(req.timestamp)
+    _validate_confidence(req.confidence)
+    _validate_speed(req.speed)
+    if req.speed is None or req.speed <= 8:
+        raise HTTPException(400, "speed must be greater than 8 km/h")
+    _check_rate_limit(req.device_id, db)
+
+    candidate = SensorCandidate(
+        device_id=req.device_id,
+        latitude=req.latitude,
+        longitude=req.longitude,
+        speed=req.speed,
+        confidence=req.confidence,
+        hazard_type=req.hazard_type,
+        status="validated",
+        timestamp=req.timestamp,
+    )
+    db.add(candidate)
+    db.commit()
+    db.refresh(candidate)
+
+    event = await _create_or_merge_hazard_event(
+        db=db,
+        latitude=req.latitude,
+        longitude=req.longitude,
+        timestamp=req.timestamp,
+        confidence=req.confidence,
+        hazard_type=req.hazard_type,
+        device_id=req.device_id,
+        description=None,
+        user_id=None,
+        source="sensor",
+    )
+    candidate.hazard_event_id = event.id
+    db.add(candidate)
+    db.commit()
+
+    return {
+        "success": True,
+        "hazard": _fmt_event(event),
+        "candidate_id": candidate.id,
+    }
+
+
+UPLOAD_DIR = "uploads/hazard-images"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+@app.post("/hazard-reports")
+async def create_hazard_report(
+    image: UploadFile = File(...),
+    latitude: float = Form(...),
+    longitude: float = Form(...),
+    hazard_type: int = Form(...),
+    confidence: float = Form(...),
+    description: str = Form(""),
+):
+    try:
+        filename = f"{uuid.uuid4()}_{image.filename}"
+        file_path = os.path.join(UPLOAD_DIR, filename)
+
+        with open(file_path, "wb") as f:
+            f.write(await image.read())
+
+        new_hazard = {
+            "id": str(uuid.uuid4()),
+            "latitude": latitude,
+            "longitude": longitude,
+            "hazard_type": hazard_type,
+            "confidence": confidence,
+            "description": description,
+            "image_url": f"/uploads/hazard-images/{filename}",
+            "status": "active",
+        }
+
+        hazards.append(new_hazard)
+
+        return {
+            "success": True,
+            "data": new_hazard
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@app.get("/hazards")
+def list_hazards():
+    return {"hazards": hazards, "count": len(hazards)}
+
+
+@app.put("/hazards/{hazard_id}/status")
+async def update_hazard_status(
+    hazard_id: int,
+    req: HazardStatusReq,
+    _: User = Depends(get_admin),
+    db: Session = Depends(get_db),
+    request: Request = None,
+):
+    allowed = {"PENDING", "ACTIVE", "VERIFIED", "SOLVED", "IGNORED", "CONFIRMED"}
+    status_value = req.status.strip().upper()
+    if status_value not in allowed:
+        raise HTTPException(400, "Invalid status value")
+    event = db.query(HazardEvent).filter_by(id=hazard_id).first()
+    if not event:
+        raise HTTPException(404, "Hazard not found")
+    event.status = status_value
+    db.add(event)
+    if event.cluster_id:
+        cluster = db.query(EventCluster).filter_by(id=event.cluster_id).first()
+        if cluster:
+            cluster.status = status_value
+            db.add(cluster)
+    db.commit()
+    await _broadcast_hazard_update({"type": "hazard_update", "action": "status_changed", "hazard": _fmt_event(event, request)})
+    return {"success": True, "hazard": _fmt_event(event, request)}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -465,33 +1035,37 @@ async def report_hazard(
             f.write(await image.read())
         image_path = path
 
-    # Run simulated YOLOv8 inference
+    _validate_coordinates(latitude, longitude)
+    _validate_timestamp(datetime.utcnow())
+
     confidence = round(random.uniform(0.70, 0.97), 3)
     detected_type = hazard_type if hazard_type is not None else random.choice([1, 2])
-    label_names = {0: "NORMAL", 1: "SPEED_BREAKER", 2: "POTHOLE"}
 
-    # Store as a HazardEvent too (so it appears on map)
-    event = HazardEvent(
-        latitude=latitude, longitude=longitude,
-        label=detected_type,
-        label_name=label_names.get(detected_type, "POTHOLE"),
-        hazard_type=detected_type,
+    event = await _create_or_merge_hazard_event(
+        db=db,
+        latitude=latitude,
+        longitude=longitude,
+        timestamp=datetime.utcnow(),
         confidence=confidence,
-        p_sensor=None, p_vision=confidence,
-        status="ACTIVE",
-        user_id=current_user.id,
+        hazard_type=detected_type,
+        device_id=str(current_user.id),
         description=description,
+        user_id=current_user.id,
+        image_path=image_path,
+        source="user_report",
     )
-    db.add(event)
 
     report = HazardReport(
         user_id=current_user.id,
+        device_id=str(current_user.id),
         latitude=latitude, longitude=longitude,
         description=description,
         image_path=image_path,
         hazard_type=detected_type,
         confidence=confidence,
         status="pending",
+        hazard_event_id=event.id,
+        source="user_report",
     )
     db.add(report)
 
@@ -503,17 +1077,13 @@ async def report_hazard(
         "success": True,
         "message": "Report submitted and analysed",
         "report_id": report.id,
-        "event_id": event.id,
+        "hazard_id": event.id,
         "status": "pending",
         "analysis": {
             "hazard_detected": True,
             "hazard_type": detected_type,
-            "hazard_label": label_names.get(detected_type),
+            "hazard_label": {1: "SPEED_BREAKER", 2: "POTHOLE"}.get(detected_type),
             "confidence": confidence,
-            "bounding_boxes": [
-                {"x1": 120, "y1": 80, "x2": 340, "y2": 260,
-                 "class": label_names.get(detected_type), "conf": confidence}
-            ],
         },
     }
 
@@ -788,56 +1358,23 @@ def admin_analytics(
 
 
 # ─────────────────────────────────────────────────────────────
-#  WEBSOCKET  — /ws/live  (real-time sensor stream)
+#  WEBSOCKET  — /ws/hazards  (confirmed hazard updates only)
 # ─────────────────────────────────────────────────────────────
-@app.websocket("/ws/live")
-async def ws_live(websocket: WebSocket, db: Session = Depends(get_db)):
+@app.websocket("/ws/hazards")
+async def ws_hazards(websocket: WebSocket):
     await websocket.accept()
-    await websocket.send_json({"type": "status", "message": "Connected to RoadGuard backend"})
+    hazard_subscribers.append(websocket)
+    await websocket.send_json({"type": "status", "message": "Connected to confirmed hazard updates"})
     try:
         while True:
-            raw = await websocket.receive_json()
-            sensor = raw.get("sensor", [])
-            loc    = raw.get("location", {})
-            result = _simulate_cnn(sensor)
-
-            if result["hazard_detected"]:
-                label     = result["hazard_type"]
-                lbl_names = {1: "speed_bump", 2: "pothole"}
-                hazard_name = lbl_names.get(label, "pothole")
-
-                # Persist
-                db.add(HazardEvent(
-                    latitude=loc.get("lat", 0),
-                    longitude=loc.get("lng", 0),
-                    label=label,
-                    label_name=hazard_name.upper(),
-                    hazard_type=label,
-                    confidence=result["confidence"],
-                    p_sensor=result["confidence"],
-                    status="ACTIVE",
-                ))
-                db.commit()
-
-                await websocket.send_json({
-                    "type":            "hazard_alert",
-                    "hazard_detected": True,
-                    "hazard_type":     hazard_name,
-                    "confidence":      result["confidence"],
-                    "location":        loc,
-                    "timestamp":       datetime.utcnow().isoformat(),
-                })
-            else:
-                await websocket.send_json({
-                    "type":            "hazard_alert",
-                    "hazard_detected": False,
-                    "hazard_type":     "normal",
-                    "confidence":      result["confidence"],
-                })
+            await websocket.receive_text()
     except WebSocketDisconnect:
-        log.info("WebSocket client disconnected")
+        log.info("Hazard update websocket disconnected")
     except Exception as e:
         log.error(f"WebSocket error: {e}")
+    finally:
+        if websocket in hazard_subscribers:
+            hazard_subscribers.remove(websocket)
 
 
 # ─────────────────────────────────────────────────────────────

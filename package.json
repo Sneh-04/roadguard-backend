@@ -1,0 +1,7 @@
+{
+  "name": "roadguard-backend",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
+  }
+}
