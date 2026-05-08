@@ -4,6 +4,7 @@ FastAPI + SQLite  |  No ML models required  |  Render-ready
 All routes match what the React Native frontend calls.
 """
 import os
+import re
 import uuid
 import logging
 import random
@@ -361,19 +362,17 @@ def _validate_coordinates(latitude: float, longitude: float):
 
 def _validate_timestamp(timestamp: datetime):
     if timestamp.tzinfo is not None:
-        timestamp = timestamp.replace(tzinfo=None)  # Make naive
+        timestamp = timestamp.replace(tzinfo=None)
     now = datetime.utcnow()
-    if timestamp > now + timedelta(minutes=2):
+    if timestamp > now + timedelta(minutes=5):
         raise HTTPException(400, "timestamp cannot be in the future")
-    if timestamp < now - timedelta(hours=1):
+    if timestamp < now - timedelta(hours=24):
         raise HTTPException(400, "timestamp is too old")
 
 
 def _validate_confidence(confidence: float):
     if confidence is None or not (0.0 <= confidence <= 1.0):
         raise HTTPException(400, "confidence must be between 0.0 and 1.0")
-    if confidence < 0.30:
-        raise HTTPException(400, "confidence is too low for confirmed hazard reporting")
 
 
 def _validate_speed(speed: Optional[float]):
@@ -386,8 +385,7 @@ def _validate_speed(speed: Optional[float]):
 def _validate_device_id(device_id: str):
     if not device_id or len(device_id) > 64:
         raise HTTPException(400, "device_id is required and must be under 64 chars")
-    normalized = device_id.replace("-", "").replace("_", "")
-    if not normalized.isalnum():
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", device_id):
         raise HTTPException(400, "device_id contains invalid characters")
 
 
@@ -776,8 +774,6 @@ async def ingest_sensor_event(req: SensorEventReq, db: Session = Depends(get_db)
     _validate_timestamp(req.timestamp)
     _validate_confidence(req.confidence)
     _validate_speed(req.speed)
-    if req.speed is None or req.speed <= 8:
-        raise HTTPException(400, "speed must be greater than 8 km/h")
     _check_rate_limit(req.device_id, db)
 
     candidate = SensorCandidate(
