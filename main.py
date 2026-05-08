@@ -168,9 +168,27 @@ def get_db():
         db.close()
 
 
+def _ensure_sqlite_schema():
+    if "sqlite" not in DB_URL:
+        return
+
+    conn = engine.raw_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(hazard_events)")
+        hazard_cols = [row[1] for row in cursor.fetchall()]
+        if "image_path" not in hazard_cols:
+            cursor.execute("ALTER TABLE hazard_events ADD COLUMN image_path TEXT")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def seed_db():
-    """Create tables and seed default users + sample hazards."""
+    """Create tables and seed default users."""
     Base.metadata.create_all(bind=engine)
+    _ensure_sqlite_schema()
+
     db = SessionLocal()
     try:
         # Seed admin
@@ -191,36 +209,9 @@ def seed_db():
             ))
         db.commit()
 
-        # Seed sample hazard events if empty
-        if db.query(HazardEvent).count() == 0:
-            sample_hazards = [
-                # Hyderabad coords ±0.05 scatter
-                (17.3850 + random.uniform(-0.04, 0.04),
-                 78.4867 + random.uniform(-0.04, 0.04),
-                 2, "POTHOLE",  0.87),
-                (17.3850 + random.uniform(-0.04, 0.04),
-                 78.4867 + random.uniform(-0.04, 0.04),
-                 1, "SPEED_BREAKER", 0.92),
-                (17.3850 + random.uniform(-0.04, 0.04),
-                 78.4867 + random.uniform(-0.04, 0.04),
-                 2, "POTHOLE", 0.78),
-                (17.3850 + random.uniform(-0.04, 0.04),
-                 78.4867 + random.uniform(-0.04, 0.04),
-                 1, "SPEED_BREAKER", 0.95),
-                (17.3850 + random.uniform(-0.04, 0.04),
-                 78.4867 + random.uniform(-0.04, 0.04),
-                 2, "POTHOLE", 0.81),
-            ]
-            for lat, lng, label, name, conf in sample_hazards:
-                db.add(HazardEvent(
-                    latitude=lat, longitude=lng,
-                    label=label, label_name=name, hazard_type=label,
-                    confidence=conf, p_sensor=conf,
-                    status="ACTIVE",
-                    timestamp=datetime.utcnow() - timedelta(minutes=random.randint(5, 120)),
-                ))
-            db.commit()
-            log.info("Seeded sample hazard events")
+        # Sample hazard seeding is disabled so analytics and counts reflect real user data only.
+        # if db.query(HazardEvent).count() == 0:
+        #     ...
     finally:
         db.close()
 
@@ -633,9 +624,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-reports: List[dict] = []
-hazards: List[dict] = []
-
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -646,7 +634,7 @@ async def log_requests(request: Request, call_next):
 
 @app.on_event("startup")
 def startup():
-    # seed_db()
+    seed_db()
     log.info("RoadGuard-AI backend started")
 
 
@@ -839,42 +827,82 @@ async def create_hazard_report(
     longitude: float = Form(...),
     hazard_type: int = Form(...),
     confidence: float = Form(...),
-    description: str = Form(""),
+    description: Optional[str] = Form(None),
+    request: Request = None,
+    db: Session = Depends(get_db),
 ):
-    try:
-        filename = f"{uuid.uuid4()}_{image.filename}"
-        file_path = os.path.join(UPLOAD_DIR, filename)
+    _validate_coordinates(latitude, longitude)
+    _validate_confidence(confidence)
 
-        with open(file_path, "wb") as f:
-            f.write(await image.read())
+    image_path = _save_hazard_image(image)
+    timestamp = datetime.utcnow()
 
-        new_hazard = {
-            "id": str(uuid.uuid4()),
-            "latitude": latitude,
-            "longitude": longitude,
-            "hazard_type": hazard_type,
-            "confidence": confidence,
-            "description": description,
-            "image_url": f"/uploads/hazard-images/{filename}",
-            "status": "active",
-        }
+    event = await _create_or_merge_hazard_event(
+        db=db,
+        latitude=latitude,
+        longitude=longitude,
+        timestamp=timestamp,
+        confidence=confidence,
+        hazard_type=hazard_type,
+        device_id="anonymous",
+        description=description,
+        user_id=None,
+        image_path=image_path,
+        source="user_report",
+    )
 
-        hazards.append(new_hazard)
+    report = HazardReport(
+        user_id=None,
+        device_id="anonymous",
+        latitude=latitude,
+        longitude=longitude,
+        description=description,
+        image_path=image_path,
+        status="pending",
+        hazard_type=hazard_type,
+        confidence=confidence,
+        hazard_event_id=event.id,
+        source="user_report",
+    )
+    db.add(report)
+    db.commit()
+    db.refresh(report)
 
-        return {
-            "success": True,
-            "data": new_hazard
-        }
-
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
+    return {
+        "success": True,
+        "message": "Hazard report accepted",
+        "report_id": report.id,
+        "hazard": _fmt_event(event, request),
+    }
 
 
 @app.get("/hazards")
-def list_hazards():
+def list_hazards(
+    request: Request,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    radius_m: Optional[float] = None,
+    hazard_type: Optional[int] = None,
+    status: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    query = db.query(HazardEvent).filter(HazardEvent.is_duplicate == False)
+    if status:
+        statuses = [s.strip().upper() for s in status.split(",") if s.strip()]
+        if "ALL" not in statuses:
+            query = query.filter(HazardEvent.status.in_(statuses))
+    if hazard_type is not None:
+        query = query.filter(HazardEvent.hazard_type == hazard_type)
+
+    hazards = []
+    for event in query.order_by(HazardEvent.timestamp.desc()).all():
+        hazard = _fmt_event(event, request)
+        if lat is not None and lng is not None:
+            hazard["distance"] = round(_haversine_meters(lat, lng, event.latitude, event.longitude), 1)
+            if radius_m is not None and hazard["distance"] > radius_m:
+                continue
+        hazards.append(hazard)
+
     return {"hazards": hazards, "count": len(hazards)}
 
 
