@@ -1315,12 +1315,15 @@ def admin_list_users(
 
 @app.get("/api/admin/reports")
 def admin_reports(
+    request: Request,
     _: User = Depends(get_admin),
     db: Session = Depends(get_db),
 ):
     reports = db.query(HazardReport).order_by(HazardReport.created_at.desc()).all()
-    return {"reports": [
-        {
+    result = []
+    for r in reports:
+        event = db.query(HazardEvent).filter_by(id=r.hazard_event_id).first()
+        result.append({
             "id": r.id,
             "user_id": r.user_id,
             "latitude": r.latitude,
@@ -1330,9 +1333,9 @@ def admin_reports(
             "hazard_type": r.hazard_type,
             "confidence": r.confidence,
             "created_at": r.created_at.isoformat() if r.created_at else None,
-        }
-        for r in reports
-    ]}
+            "hazard": _fmt_event(event, request) if event else None,
+        })
+    return {"reports": result, "count": len(result)}
 
 
 @app.put("/api/admin/users/{user_id}/ban")
